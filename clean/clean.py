@@ -1,172 +1,107 @@
-import functools
-import gzip
-import hashlib
-import heapq
-import io
+#!/usr/bin/env python
+# -*- coding: utf-8 -*- 
+INDIC_NLP_LIB_HOME="./indic_nlp_library"
+INDIC_NLP_RESOURCES="./indic_nlp_resources"
+
+from indicnlp import common
+common.set_resources_path(INDIC_NLP_RESOURCES)
+
+from indicnlp import loader
+loader.load()
+
 import re
-import threading
-import nltk
-
-from langdetect import detect
-from langdetect.lang_detect_exception import LangDetectException
-from langdetect import DetectorFactory
-
-DetectorFactory.seed = 0
-
-# from absl import logging
-import tensorflow.compat.v2 as tf
-# import tensorflow_datasets.public_api as tfds
-
-# WET file constants
-_PAGE_DELIMITER = "WARC/1.0"
-_URL_KEY = "WARC-Target-URI:"
-_URL_DATE = "WARC-Date:"
-_CONTENT_TYPE = "Content-Type:"
-_CONTENT_LEN = "Content-Length:"
-_METADATA_PREFIXES = ("WARC", "CONTENT-", "Content-")
-
-# Filters
+from langdetect import detect_langs
+from indicnlp.tokenize import sentence_tokenize
+from .badwords_en_hi_hiR import badword_list
+# Constants
 _MIN_WORDS_PER_LINE = 3
-_MIN_NUM_SENTENCES = 5
-_MAX_WORD_LENGTH = 250
-_END_MARKS = (".", "?", "!", "\"")
+_MIN_NUM_SENTENCES = 3
+_MAX_WORD_LENGTH = 150
+_HINDI_END_MARKS = ("।", "?", "!", "\"", "," ,"॥")
 _ELLIPSIS = "..."
 _POLICY_SUBSTRINGS = [
     "terms of use", "privacy policy", "cookie policy", "uses cookies",
-    "use of cookies", "use cookies", "elementen ontbreken aan deze printversie"
+    "use of cookies", "use cookies", "उपयोग की शर्तें", "गोपनीयता नीति",
+    "कुकी नीति", "कुकीज़ का उपयोग करता है"
 ]
 
-# Memoized sentence tokenizer.
-_SENTENCE_TOKENIZER = None
+# Regex patterns
+URL_REGEX = re.compile(r'http[s]?://\S+|www\.\S+')
+EMAIL_REGEX = re.compile(r'\S+@\S+\.\S+')
+EXTRA_SPACES_REGEX = re.compile(r'[ \t]+')
 
-UNKNOWN_LANGUAGE = "und"
-
-citation_regex = re.compile(r"\[\d*\]|\[edit\]|\[citation needed\]")
-
-from .badwords_ennl import badword_list
 badwords_regex = re.compile(r"(?:\W|^)({})(?:\W|$)".format("|".join(badword_list)))
 
-
-
 def badwords_filter(text):
-  badwords_found = badwords_regex.search(text.lower())
-  if badwords_found is not None:
-    return False
-  return True
+    badwords_found = badwords_regex.search(text.lower())
+    return badwords_found is None
 
+def remove_urls_and_emails(text):
+    text = URL_REGEX.sub("", text)
+    text = EMAIL_REGEX.sub("", text)
+    return text
 
-def clean_text(text,
-               citation_regex=citation_regex,
-               min_words_per_line=_MIN_WORDS_PER_LINE,
-               min_num_sentences=_MIN_NUM_SENTENCES,
-               max_word_length=_MAX_WORD_LENGTH):
-  """Cleans a CommonCrawl page, yielding nothing if it should be skipped.
+def remove_extra_spaces(text):
+    return EXTRA_SPACES_REGEX.sub(" ", text).strip()
 
-  Cleaning removes lines with no end marks or with too few words. After line
-  filtering, pages are filtered out if they have too few sentences based on a
-  simple count of end marks.
+def clean_text(text, min_words_per_line=_MIN_WORDS_PER_LINE, min_num_sentences=_MIN_NUM_SENTENCES, max_word_length=_MAX_WORD_LENGTH):
+    if not isinstance(text, str):
+        return None  # Skip non-string inputs
+    try:
+        # Language check
+        probabilities = detect_langs(text)
+        if not any(lang.lang == 'hi' and lang.prob > 0.99 for lang in probabilities):
+            return None  # Skip text if not Hindi with high probability
 
-  Args:
-    text: text of the page
-    citation_regex: Regex to use for finding Wikipedia-like citations to filter.
-    counter_inc_fn: function, a function taking the name of a counter to be
-      incremented and the (optional) amount. Defaults to a beam Metric counter.
-    min_words_per_line: int, the minimum number of words a line needs to not be
-      removed.
-    min_num_sentences: int, the minimum number of sentences a page needs to not
-      be skipped.
-    max_word_length: int, the maximum number of characters allowed in a word.
-      Lines containing a word with too many characters are removed.
+        # Remove URLs and emails
+        text = remove_urls_and_emails(text)
+        text = remove_extra_spaces(text)
 
-  Yields:
-    The url and cleaned text for the page.
-  """
+        lines = text.splitlines()
+        valid_lines = []
+        num_sentences = 0
 
-  lines = text.splitlines()
-  valid_lines = []
-  num_sentences = 0
+        if not badwords_filter(text):
+            return None
 
-  if not badwords_filter(text):
-    counter_inc_fn("badword-filtered: not passed")
-    return
+        for line in lines:
+            line = line.strip()
+            if len(line.split()) < min_words_per_line or any(len(word) > max_word_length for word in line.split()):
+                continue
+            if not line.endswith(_HINDI_END_MARKS) or line.endswith(_ELLIPSIS):
+                continue
+            if any(policy in line for policy in _POLICY_SUBSTRINGS):
+                continue
+            num_sentences += len(sentence_tokenize.sentence_split(line, lang='hi'))
+            valid_lines.append(line)
 
-  def line_has_too_long_word(line):
-    for word in line.split():
-      if len(word) > max_word_length:
-        return True
-    return False
+        if num_sentences < min_num_sentences:
+            return None
 
-  for line in lines:
-    line = line.strip()
-    if line_has_too_long_word(line):
-      counter_inc_fn("line-filtered:too_long_word")
-      continue
-    line = citation_regex.sub("", line)
-    if not line.endswith(_END_MARKS) or line.endswith(_ELLIPSIS):
-      counter_inc_fn("line-filtered:no_endmark")
-      continue
-    if len(line.split()) < min_words_per_line:
-      counter_inc_fn("line-filtered:too_short")
-      continue
-    line_lower = line.lower()
-    # Remove documents which contain lorem ipsum
-    if "lorem ipsum" in line_lower:
-      counter_inc_fn("filtered:loremipsum")
-      return
-    # Remove "javascript must be enabled" notices
-    if "javascript" in line_lower:
-      counter_inc_fn("line-filtered:javascript")
-      continue
-    # Remove docs which probably contain javascript code
-    if "{" in line:
-      counter_inc_fn("filtered:squigglybracket")
-      return
-    # Remove policy lines
-    if any(p in line_lower for p in _POLICY_SUBSTRINGS):
-      counter_inc_fn("line-filtered:policy")
-      continue
-    num_sentences += len(_get_sentences(line))
-    valid_lines.append(line)
-    counter_inc_fn("line-passed")
+        result = "\n".join(valid_lines).strip()
+        return result if 500 <= len(result) <= 50000 else None
 
-  if num_sentences < min_num_sentences:
-    counter_inc_fn("filtered:too_few_sentences")
-    return
-  counter_inc_fn("passed")
-  result = "\n".join(valid_lines).strip()
-  if len(result) < 500 or len(result) > 50000:
-    counter_inc_fn("filtered:size too small or too big")
-  if detect(result) != 'nl':
-    counter_inc_fn("filtered:not dutch")
-    return
+    except Exception as e:
+        # print(f"An error occurred: {e}")
+        return None
 
-  return result
+if __name__ == "__main__":
 
-
-def _get_sentences(text):
-  global _SENTENCE_TOKENIZER
-  if not _SENTENCE_TOKENIZER:
-    _SENTENCE_TOKENIZER = _load_sentence_tokenizer()
-  return list(_SENTENCE_TOKENIZER.tokenize(tf.compat.as_text(text)))
-
-
-_nltk_lock = threading.Lock()
-
-def _load_sentence_tokenizer():
-  """Returns a sentence tokenization function."""
-  # Lock to avoid a race-condition in the creation of the download directory.
-  with _nltk_lock:
-    nltk.download("punkt")
-    return nltk.data.load("nltk:tokenizers/punkt/english.pickle")
-
-
-count_dict = dict()
-
-def counter_inc_fn(what):
-  if what in count_dict:
-    count_dict[what] += 1
-  else:
-    count_dict[what] = 1
-
-
-
+    test_string = """"6 साल की बच्ची अपनी मां के लिए बनी मां | UPUKLive
+    6 साल की बच्ची अपनी मां के लिए बनी मां
+    जो प्यार, करुणा और देखभाल का स्वभाव ईश्वर ने बेटियों को दिया है, वह बेटों को हासिल नहीं है। मां को ब्रेन हैमरेज हो जाने के बाद छह साल की मासूम ने जिस तरह से मां की देखभाल की, उसे देखकर लगता है कि मां असल में बेटी है और बेटी मां है। काई चेंगचेंग जब महज छह साल की थी, तो उसकी मां चेन ली को ब्रेन हैमरेज हो गया था। इसकी वजह से उनकी याददाश्त खराब हो गई।
+    बीते चार साल से अपनी मां को पढ़ना, लिखना और बोलना सिखाना ही काई की दिनचर्या का हिस्सा हो गया है। वह कहती है कि कभी मां ने मुझे पढ़ना, लिखना सिखाया था, अब मेरी बारी है कि मैं अपनी मां को पढ़ना लिखना सिखाऊं। मैं मां के लिए पढ़ाई किसी खेल की तरह सिखाती हूं, ताकि उनके लिए इसे समझना https://3.bp.blogspot.com/-CJyEsqibU60/W_Q7SAtg7MI/AAAAAAADdhM/8xf2fBeqM7EYImZcZM-WAYu79KjX0JocwCK4BGAYYCw/s640/-%2Bupuklive%2B-%2BCopy%2B%25282%2529.PNG
+    आसान हो http://www.upuklive.com/2018/11/6_20.html जाए।
+    उदाहरण के लिए जब मैं उन्हें एपल के बारे में बताती हूं, तो उन्हें सेब देती हूं, ताकि वह इसे खाकर उसका स्वाद और उसके बारे में जान सकें। जब मैं रैबिट के बारे में बताती हूं, तो उन्हें खरगोश पकड़ने के लिए देती हूं।
+    काई के पिता एक छोटी सी दुकान चलाकर परिवार का पालन-पोषण और पत्नी के इलाज का खर्च निकाल रहे हैं। इसलिए वह पत्नी की देखभाल के लिए ज्यादा समय नहीं निकाल पाते हैं। वहीं, बड़ा भाई काई लिंग ने हाई स्कूल में दाखिला लिया है, जिसकी वजह से वह भी मां की देखभाल नहीं कर पाता है। ऐसे में काई ही अपनी मां की देखभाल करती हैं।
+    वह मां को चीनी भाषा सिखाने के साथ ही उन्हें रोज समय पर दवाएं देना भी नहीं भूलती हैं। इसके साथ ही मां को जल्दी से ठीक करने के लिए वह फीजियोथैरेपी एक्सरसाइज कराती हैं। काई कहती हैं कि मां को हाई ब्लड प्रेशर की बीमारी है और ठीक होने के लिए उन्हें लगातार समय पर दवाएं लेना जरूरी है। यदि कोई उन्हें याद नहीं दिलाए, तो वह दवा लेना ही भूल जाती हैं।
+    बीचे चार साल से काई लगातार कड़ी चुनौतियों का सामना करने के बावजूद स्कूल में न सिर्फ अच्छे ग्रेड हासिल करती हैं, बल्कि लीडरशिप रोल भी निभाती हैं। मां के प्रति काई के समर्पण को देखते हुए स्थानीय सरकार ने उन्हें पुरस्कृत किया है और स्थानीय सरकारी ब्रॉडकास्टर सीसीटीवी ने भी उन्हें पहचान दी है। चीन की मीडिया उन लोगों के बारे में अक्सर समाचार दिखाती है, जो इस तरह के काम करते हैं।
+    UPUKLive: 6 साल की बच्ची अपनी मां के लिए बनी मां
+    https://3.bp.blogspot.com/-CJyEsqibU60/W_Q7SAtg7MI/AAAAAAADdhM/8xf2fBeqM7EYImZcZM-WAYu79KjX0JocwCK4BGAYYCw/s72-c/-%2Bupuklive%2B-%2BCopy%2B%25282%2529.PNG
+    "
+    """
+    cleaned_text = clean_text(test_string)
+    if cleaned_text:
+        print("Cleaned Text:\n", cleaned_text)
+    else:
+        print("Text was not processed or did not meet the criteria for cleaning.")
